@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-: "${ROS_DISTRO:?Activate the NVIDIA Isaac ROS 5.0 environment first}"
+if [[ -z "${ROS_DISTRO:-}" ]]; then
+  if [[ ! -f /opt/ros/lyrical/setup.bash ]]; then
+    echo 'ROS 2 Lyrical이 없습니다. README의 Ubuntu 24.04 NVIDIA Buildfarm 설치 안내를 먼저 따르세요.' >&2
+    exit 1
+  fi
+  # ROS setup scripts may reference unset variables while this script uses nounset.
+  set +u
+  source /opt/ros/lyrical/setup.bash
+  set -u
+fi
 [[ "$ROS_DISTRO" == lyrical ]] || { echo 'Lyrical is required' >&2; exit 1; }
 command -v vcs >/dev/null
 command -v rosdep >/dev/null
