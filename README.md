@@ -30,6 +30,12 @@ export GZ_PARTITION=waffle_course
 ros2 launch waffle_slam_course gazebo.launch.py gui:=true
 ```
 
+`build_lyrical.sh`는 ROS 환경이 비어 있으면 `/opt/ros/lyrical/setup.bash`를
+자동으로 불러온다. 파일 자체가 없다면 위 Buildfarm 안내에 따라 Lyrical을 먼저
+설치한다. 다른 ROS 배포판을 불러온 터미널에서는 새 터미널을 열어 실행한다.
+빌드 스크립트의 source는 부모 터미널에 남지 않으므로 빌드 후 launch를 실행할
+터미널에서는 위 예시처럼 `source /opt/ros/lyrical/setup.bash`와 workspace source를 수행한다.
+
 새 터미널에서 SLAM을 실행한다.
 
 ```bash
@@ -53,6 +59,161 @@ ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args \
 기존 Gazebo 서버가 남아 있으면 새 GUI가 이전 월드에 연결될 수 있다.
 이전 실습의 서버와 GUI를 종료한 뒤 실행한다. 다른 프로젝트의 Gazebo를 함께
 실행할 경우 서로 다른 `GZ_PARTITION`과 `ROS_DOMAIN_ID`를 사용한다.
+
+## 지도 저장
+
+Gazebo와 Cartographer를 실행하고 키보드로 필요한 통로를 탐색한다.
+정지 키 `k`를 누른 뒤 **Cartographer를 종료하기 전에** 새 터미널에서 저장한다.
+아래 `WORKSPACE`는 실제 빌드한 폴더로 지정한다. 이전 실습 폴더에서 빌드했다면
+그 폴더를 사용한다. Gazebo의 월드 STL과 SLAM이 만드는 점유 격자 지도는 서로 다르다.
+
+```bash
+source /opt/ros/lyrical/setup.bash
+WORKSPACE="$HOME/waffle-lyrical-slam"
+source "$WORKSPACE/install/setup.bash"
+export ROS_DOMAIN_ID=174
+
+ros2 topic info /map
+mkdir -p "$HOME/slam_maps"
+MAP_PREFIX="$HOME/slam_maps/maze_$(date +%Y%m%d_%H%M%S)"
+ros2 run nav2_map_server map_saver_cli \
+  -f "$MAP_PREFIX" --ros-args -p use_sim_time:=true
+ls -lh "${MAP_PREFIX}.pgm" "${MAP_PREFIX}.yaml"
+```
+
+- `.pgm`: 관측한 장애물·자유 공간·미관측 영역을 표시한 지도 이미지.
+- `.yaml`: 이미지 경로, 해상도, 지도 원점 등 Nav2가 읽을 설정.
+
+두 파일을 함께 보관한다. 파일명이 출력되고 저장 명령이 성공했는지 확인한다.
+`/map`이 없으면 Cartographer가 실행 중인지, 모든 터미널의 domain이 174인지
+확인한다. 탐색하지 않은 영역까지 자동으로 채워지지는 않는다.
+
+Cartographer 상태도 보관하려면 **위와 같은 터미널에서**, Cartographer가 살아 있을 때 실행한다.
+Nav2의 AMCL 실행에는 PGM/YAML을 사용하며 `.pbstream`을 직접 넣지 않는다.
+
+```bash
+ros2 service call /write_state cartographer_ros_msgs/srv/WriteState \
+  "{filename: '${MAP_PREFIX}.pbstream', include_unfinished_submaps: true}"
+ls -lh "${MAP_PREFIX}.pbstream"
+```
+
+## 저장한 지도에서 Nav2 내비게이션
+
+아래는 **Gazebo Waffle + 2D 점유 격자 + AMCL** 경로다. cuVSLAM의 sparse 지도나
+`.pbstream`을 Nav2의 `map` 인자로 사용하지 않는다. cuVSLAM+nvblox의 3D 환경에서
+Nav2를 연결하는 절차는 별도 구성이다. 이 내비게이션 절차의 실제 목표 도달 주행은 아직 검증하지 않았다.
+
+### 1. Nav2 설치와 Waffle 설정 준비
+
+Ubuntu 24.04 NVIDIA Buildfarm의 Lyrical 환경에서 실행한다.
+확인한 `nav2_bringup` 패키지는 1.5.0이다. 설치한 버전의 기본 YAML을 가져와
+Waffle에 필요한 프레임·속도·메시지 설정만 변경한다.
+
+```bash
+source /opt/ros/lyrical/setup.bash
+sudo apt-get update
+sudo apt-get install -y ros-lyrical-navigation2 ros-lyrical-nav2-bringup python3-yaml
+mkdir -p "$HOME/slam_maps"
+python3 - <<'PY'
+from pathlib import Path
+import yaml
+from ament_index_python.packages import get_package_share_directory
+
+source = Path(get_package_share_directory('nav2_bringup')) / 'params/nav2_params.yaml'
+params = yaml.safe_load(source.read_text())
+for name in ['controller_server', 'behavior_server', 'velocity_smoother', 'collision_monitor']:
+    params[name]['ros__parameters']['enable_stamped_cmd_vel'] = True
+params['amcl']['ros__parameters']['base_frame_id'] = 'base_footprint'
+params['amcl']['ros__parameters']['scan_topic'] = '/scan'
+params['bt_navigator']['ros__parameters']['robot_base_frame'] = 'base_footprint'
+params['behavior_server']['ros__parameters']['robot_base_frame'] = 'base_footprint'
+for name in ['local_costmap', 'global_costmap']:
+    costmap = params[name][name]['ros__parameters']
+    costmap['robot_base_frame'] = 'base_footprint'
+    costmap['robot_radius'] = 0.22
+    costmap['inflation_layer']['inflation_radius'] = 0.30
+follow = params['controller_server']['ros__parameters']['FollowPath']
+assert follow['plugin'] == 'nav2_mppi_controller::MPPIController', 'Check the installed Nav2 controller configuration'
+follow.update(vx_max=0.1, vx_min=-0.1, vy_max=0.0, wz_max=0.2)
+smoother = params['velocity_smoother']['ros__parameters']
+smoother['max_velocity'] = [0.1, 0.0, 0.2]
+smoother['min_velocity'] = [-0.1, 0.0, -0.2]
+params['behavior_server']['ros__parameters']['max_rotational_vel'] = 0.2
+params['behavior_server']['ros__parameters']['min_rotational_vel'] = 0.1
+target = Path.home() / 'slam_maps/nav2_waffle.yaml'
+target.write_text(yaml.safe_dump(params, sort_keys=False))
+print(target)
+PY
+```
+
+반경 0.22m, inflation 0.30m는 이 시뮬레이션의 시작 설정이며,
+실물 장비의 치수·제동 거리를 측정한 값은 아니다.
+
+### 2. SLAM에서 저장 지도 사용으로 전환
+
+Gazebo는 실행한 상태로 둔다. Cartographer와 cuVSLAM의 launch를 Ctrl+C로 종료하고,
+키보드 텔레옵도 중지한다. `map→odom`은 AMCL만 발행하며,
+`odom→base_footprint`는 Gazebo가 발행한다. SLAM과 AMCL을 동시에 실행하지 않는다.
+
+새 터미널에서 `MAP_YAML`을 **직접 저장한 YAML의 실제 경로**로 변경한다.
+
+```bash
+source /opt/ros/lyrical/setup.bash
+export ROS_DOMAIN_ID=174
+MAP_YAML="$HOME/slam_maps/maze_YYYYMMDD_HHMMSS.yaml"
+test -f "$MAP_YAML" || { echo "MAP_YAML을 실제 저장 파일로 변경하세요"; exit 1; }
+ros2 launch nav2_bringup bringup_launch.py \
+  map:="$MAP_YAML" params_file:="$HOME/slam_maps/nav2_waffle.yaml" \
+  use_sim_time:=true autostart:=true slam:=false \
+  use_localization:=true use_composition:=false \
+  use_keepout_zones:=false use_speed_zones:=false
+```
+
+영역 마스크 파일을 준비하지 않았으므로 keepout/speed zone은 끈다.
+Nav2가 `active` 상태가 되기 전에 목표 주행을 시작하지 않는다.
+
+### 3. RViz에서 초기 위치와 목표 지정
+
+별도 터미널에서 실행한다.
+
+```bash
+source /opt/ros/lyrical/setup.bash
+export ROS_DOMAIN_ID=174
+ros2 launch nav2_bringup rviz_launch.py use_sim_time:=true
+```
+
+1. RViz의 Fixed Frame을 `map`으로 확인하고 저장 지도가 표시되는지 확인한다.
+2. **2D Pose Estimate**로 지도 위 현재 로봇의 위치와 방향을 지정한다.
+   저장 지도의 원점은 SLAM 좌표계이므로 Gazebo의 spawn 좌표를 그대로 입력하지 않는다.
+3. LiDAR 점과 지도 벽이 겹치는지 확인한다. 어긋나면 초기 위치를 다시 지정한다.
+4. **Nav2 Goal**로 지도에서 이미 관측된 자유 공간에 가까운 목표와 방향을 지정한다.
+5. 경로·local/global costmap을 보고 이동을 확인한다. 미관측 영역이나 벽 안을 목표로 지정하지 않는다.
+
+종료는 RViz/Nav2 터미널의 Ctrl+C로 수행한다. 목표 실행 중 키보드 teleop을
+같이 발행하지 않는다. 이동을 중단하려면 RViz Navigation 패널에서 목표를 취소한다.
+
+### 4. 실행 상태와 문제 확인
+
+```bash
+source /opt/ros/lyrical/setup.bash
+export ROS_DOMAIN_ID=174
+ros2 lifecycle get /amcl
+ros2 lifecycle get /controller_server
+ros2 run tf2_ros tf2_echo map base_footprint
+ros2 topic info /cmd_vel --verbose
+ros2 action list -t
+```
+
+- `/cmd_vel`은 Gazebo bridge와 동일한 `geometry_msgs/msg/TwistStamped`여야 한다.
+- `/scan`, `/odom`, `/clock`, TF가 없으면 먼저 Gazebo와 ROS domain을 확인한다.
+- `/map`은 map_server, `map→odom`은 AMCL이 담당한다. 이전 SLAM 노드가 남아 있으면 종료한다.
+- lifecycle이 `inactive`이거나 설정 오류가 있으면 Nav2 로그에서 첫 오류를 확인한다.
+- 경로가 없으면 미관측 영역, 잘못된 초기 위치, 로봇 반경·inflation과 통로 폭을 확인한다.
+  통과시키기 위해 실제 로봇보다 footprint를 작게 설정하지 않는다.
+
+참고: [Nav2 로봇 설정 가이드](https://docs.nav2.org/setup_guides/index.html),
+[Nav2 bringup launch](https://github.com/ros-navigation/navigation2/blob/main/nav2_bringup/launch/bringup_launch.py).
+실행 옵션은 설치한 Lyrical 패키지의 `bringup_launch.py`를 기준으로 확인한다.
 
 ## 검증과 범위
 
