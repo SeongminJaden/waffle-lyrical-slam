@@ -42,7 +42,7 @@ ros2 launch waffle_slam_course gazebo.launch.py gui:=true
 source /opt/ros/lyrical/setup.bash
 source ~/waffle-lyrical-slam/install/setup.bash
 export ROS_DOMAIN_ID=174
-ros2 launch waffle_slam_course cartographer.launch.py
+taskset -c 0-5 ros2 launch waffle_slam_course cartographer.launch.py
 ```
 
 다른 터미널에서 키보드로 조종한다. `i` 전진, `,` 후진, `j/l` 회전,
